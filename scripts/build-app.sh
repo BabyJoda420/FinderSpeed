@@ -1,0 +1,32 @@
+#!/bin/zsh
+# Builds FinderSpeed.app (menu bar app, no Dock icon) into ./build/. Owner: zeus.
+# Usage: scripts/build-app.sh [debug|release]   (default: release)
+set -euo pipefail
+cd "${0:A:h}/.."
+CONFIG=${1:-release}
+swift build -c "$CONFIG"
+BIN=$(swift build -c "$CONFIG" --show-bin-path)/FinderSpeed
+APP=build/FinderSpeed.app
+rm -rf "$APP"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+cp "$BIN" "$APP/Contents/MacOS/FinderSpeed"
+cat > "$APP/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleIdentifier</key><string>com.mauriziolol.finderspeed</string>
+  <key>CFBundleName</key><string>FinderSpeed</string>
+  <key>CFBundleDisplayName</key><string>FinderSpeed</string>
+  <key>CFBundleExecutable</key><string>FinderSpeed</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>0.1.0</string>
+  <key>CFBundleVersion</key><string>1</string>
+  <key>LSMinimumSystemVersion</key><string>14.0</string>
+  <key>LSUIElement</key><true/>
+  <key>NSAppleEventsUsageDescription</key><string>FinderSpeed asks Finder which folders are open so it can find where a copy is going.</string>
+</dict></plist>
+PLIST
+# Stable designated requirement keeps the Accessibility grant across rebuilds, as long as the identifier stays the same.
+codesign --force --sign - --identifier com.mauriziolol.finderspeed \
+  -r='designated => identifier "com.mauriziolol.finderspeed"' "$APP"
+echo "Built $PWD/$APP"

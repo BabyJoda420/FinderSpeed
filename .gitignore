@@ -1,0 +1,33 @@
+# Build output
+.build/
+build/
+*.app
+# Large local test data (multi-GB random files, sparse disk image)
+testdata/
+# Spike binaries and logs
+spikes/**/logs/
+spikes/progress/progresswatch
+spikes/progress/tccprobe
+spikes/progress/*.app
+spikes/rusage/rusage_monitor
+spikes/window/finder-ax-observe
+spikes/window/finder-window-probe
+spikes/window/window-driver
+spikes/window/driver/window-driver
+scripts/tools/winlist
+scripts/tools/axresize
+scripts/tools/axframes
+# Leader scratch
+.zeus-staging/
+# macOS / editors
+.DS_Store
+.swiftpm/
+*.xcuserstate
+
+# Compiled spike/probe binaries
+spikes/window/phase3/activator
+spikes/window/phase3/click
+spikes/window/phase3/fillprobe
+spikes/window/phase3/fillprobe2
+spikes/window/phase3/refwin
+spikes/window/phase3/tintprobe
