@@ -1,11 +1,15 @@
 #!/bin/zsh
 # Builds FinderSpeed.app (menu bar app, no Dock icon) into ./build/. Owner: zeus.
-# Usage: scripts/build-app.sh [debug|release]   (default: release)
+# Usage: scripts/build-app.sh [debug|release] [--universal] [--zip]   (default: release, native arch)
+#   --universal  build for Apple Silicon + Intel (arm64 + x86_64)
+#   --zip        also create build/FinderSpeed-<version>.zip for a GitHub release
 set -euo pipefail
 cd "${0:A:h}/.."
-CONFIG=${1:-release}
-swift build -c "$CONFIG"
-BIN=$(swift build -c "$CONFIG" --show-bin-path)/FinderSpeed
+CONFIG=release; ARCHS=(); ZIP=0
+for a in "$@"; do case $a in debug|release) CONFIG=$a;; --universal) ARCHS=(--arch arm64 --arch x86_64);; --zip) ZIP=1;; esac; done
+VERSION=$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//'); VERSION=${VERSION:-0.1.0}
+swift build -c "$CONFIG" $ARCHS
+BIN=$(swift build -c "$CONFIG" $ARCHS --show-bin-path)/FinderSpeed
 APP=build/FinderSpeed.app
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -19,7 +23,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleDisplayName</key><string>FinderSpeed</string>
   <key>CFBundleExecutable</key><string>FinderSpeed</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.1.0</string>
+  <key>CFBundleShortVersionString</key><string>$VERSION</string>
   <key>CFBundleVersion</key><string>1</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>LSUIElement</key><true/>
@@ -29,4 +33,9 @@ PLIST
 # Stable designated requirement keeps the Accessibility grant across rebuilds, as long as the identifier stays the same.
 codesign --force --sign - --identifier com.mauriziolol.finderspeed \
   -r='designated => identifier "com.mauriziolol.finderspeed"' "$APP"
-echo "Built $PWD/$APP"
+echo "Built $PWD/$APP ($VERSION, $(lipo -archs "$APP/Contents/MacOS/FinderSpeed"))"
+if (( ZIP )); then
+  rm -f "build/FinderSpeed-$VERSION.zip"
+  ditto -c -k --keepParent "$APP" "build/FinderSpeed-$VERSION.zip"
+  echo "Zipped $PWD/build/FinderSpeed-$VERSION.zip"
+fi

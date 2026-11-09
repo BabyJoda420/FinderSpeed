@@ -4,6 +4,13 @@ All notable changes to **finder-speed** will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-09
+
+- **First test release (v0.1.0):**
+  - Distributed as a universal binary (`arm64` + `x86_64`) supporting macOS 14+ on Apple Silicon and Intel Macs.
+  - Added "Launch at Login" menu bar option for automatic startup.
+  - Released under the MIT license.
+
 ### 2026-11-09
 
 - **Final polish (zeus; written by the leader because the documentation agent hit its usage quota):**

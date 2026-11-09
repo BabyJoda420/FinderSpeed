@@ -14,6 +14,23 @@ See [docs/visual-design.md](docs/visual-design.md) for the **Before vs. After** 
 
 ---
 
+## Install
+
+1. Download `FinderSpeed.zip` from the [GitHub Releases page](https://github.com/BabyJoda420/FinderSpeed/releases).
+2. Unzip the archive and move `FinderSpeed.app` into `/Applications`.
+3. **First launch (notarization bypass):** Because this test release is ad-hoc signed and not notarized, macOS blocks opening it by default. To allow it:
+   - Run in Terminal: `xattr -dr com.apple.quarantine /Applications/FinderSpeed.app`, or
+   - Right-click `FinderSpeed.app` → **Open**, or
+   - Go to **System Settings → Privacy & Security** and click **Open Anyway**.
+4. **Grant Accessibility:** When prompted, grant Accessibility access in **System Settings → Privacy & Security → Accessibility → FinderSpeed** (required to attach to Finder's progress window).
+5. **Launch at Login (optional):** Click the speedometer icon in the menu bar and select **Launch at Login** to start FinderSpeed automatically.
+
+> [!NOTE]
+> - **Compatibility:** Requires macOS 14.0 or later; universal build runs natively on Apple Silicon and Intel Macs.
+> - **Updating:** After updating the app, macOS may require toggling its Accessibility permission off and back on.
+
+---
+
 ## Features
 
 - **"One Continuous Window" Integration:** Detects Finder's `"Progress"` window (`AXIdentifier == "Progress"`) and seamlessly merges with its bottom edge using a 24-row click-through cap band, custom complementary shadow and `1 px` rim/outline rendering (`0.46 ms`/frame), and live background color sampling (`0` RGB diff with Screen Recording; `~3` RGB units with `.windowBackground` material fallback).
@@ -110,3 +127,9 @@ See [docs/testing.md](docs/testing.md) for full details on the test suites and c
 - [docs/feasibility.md](docs/feasibility.md) — Feasibility analysis and results from Spikes A (`NSProgress`), B (`proc_pid_rusage`), and C (`AXUIElement` / `CGWindowList`)
 - [docs/testing.md](docs/testing.md) — Unit test suite (`swift test`, 41 tests) and real Finder copy testing (`scripts/finder-copy-test.sh`)
 - [CHANGELOG.md](CHANGELOG.md) — Project history
+
+---
+
+## License
+
+[MIT](LICENSE)

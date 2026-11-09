@@ -3,6 +3,7 @@
 
 import AppKit
 import Combine
+import ServiceManagement
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -68,12 +69,35 @@ extension AppDelegate: NSMenuDelegate {
                                     action: #selector(requestAccessibility), keyEquivalent: "")
             item.target = self
         }
+        let login = menu.addItem(withTitle: "Launch at Login", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
+        login.target = self
+        login.state = LaunchAtLogin.isEnabled ? .on : .off
         let demo = menu.addItem(withTitle: "Show Demo Panel", action: #selector(showDemo), keyEquivalent: "d")
         demo.target = self
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
+        menu.addItem(withTitle: "FinderSpeed \(version)", action: nil, keyEquivalent: "")
         menu.addItem(.separator())
         menu.addItem(withTitle: "Quit FinderSpeed", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
     }
 
     @objc private func requestAccessibility() { AccessibilityPermission.prompt() }
     @objc private func showDemo() { PanelWiring.showDemo(app: self) }
+    @objc private func toggleLaunchAtLogin() { LaunchAtLogin.toggle() }
+}
+
+/// "Launch at Login" via SMAppService (macOS 13+). Only works when running from an .app bundle.
+@MainActor
+enum LaunchAtLogin {
+    static var isEnabled: Bool { SMAppService.mainApp.status == .enabled }
+
+    static func toggle() {
+        do {
+            if isEnabled { try SMAppService.mainApp.unregister() } else { try SMAppService.mainApp.register() }
+        } catch {
+            let alert = NSAlert()
+            alert.messageText = "Couldn't change Launch at Login"
+            alert.informativeText = "\(error.localizedDescription)\n\nMove FinderSpeed.app to /Applications and try again."
+            alert.runModal()
+        }
+    }
 }
