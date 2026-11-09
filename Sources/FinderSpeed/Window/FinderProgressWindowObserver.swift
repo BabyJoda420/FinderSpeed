@@ -127,6 +127,9 @@ public final class FinderProgressWindowObserver {
         RunLoop.main.add(t, forMode: .common)
         safetyTimer = t
 
+        // Process-wide AX timeout: elements derived from the app element (window, rows) don't inherit
+        // its timeout and would otherwise wait up to the 6 s default. (Reads are off the main thread.)
+        AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), Self.messagingTimeout)
         if AccessibilityPermission.isTrusted {
             attach()
         } else {
@@ -165,20 +168,36 @@ public final class FinderProgressWindowObserver {
     private var appElement: AXUIElement?
     private var axObserver: AXObserver?
     private var windowElement: AXUIElement?
-    private var rowRefreshPending = false
 
-    private static let progressIdentifier = "Progress"
-    private static let messagingTimeout: Float = 0.5
+    /// All AX reads run here (BUG-001: synchronous AX calls to a busy Finder blocked the main thread).
+    private let axQueue = DispatchQueue(label: "finder-speed.ax", qos: .userInitiated)
+    /// Bumped on track/untrack/detach; results from an older generation are dropped.
+    private var generation = 0
+    private var attachInFlight = false
+    private var scanInFlight = false
+    private var verifyInFlight = false
+    private var readInFlight = false
+    private var readPending = false
+    private var pendingTrigger: Event?
+    private var consecutiveFailures = 0
+    private var lastIsMain = false
+
+    nonisolated private static let progressIdentifier = "Progress"
+    private static let messagingTimeout: Float = 1.0
 
     nonisolated private static func isFinder(_ note: Notification) -> Bool {
         (note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.bundleIdentifier == FinderApp.bundleID
     }
 
     private func log(_ s: @autoclosure () -> String) {
-        if debugLogging { print("[window] \(s())"); fflush(stdout) }
+        if WindowDiagnostics.enabled { WindowDiagnostics.log("observer", s()) }
+        else if debugLogging { print("[window] \(s())"); fflush(stdout) }
     }
 
     private func emit(_ event: Event) {
+        if event != .rowsChanged {
+            log("event \(event) frame=\(window.map { "\($0.frame)" } ?? "-") active=\(window?.isActive ?? false) rows=\(window?.rowCount ?? 0)")
+        }
         for (_, h) in handlers { h(event, window) }
     }
 
@@ -197,7 +216,7 @@ public final class FinderProgressWindowObserver {
     }
 
     private func attach() {
-        guard started, AccessibilityPermission.isTrusted else { return }
+        guard started, AccessibilityPermission.isTrusted, !attachInFlight else { return }
         guard let finder = FinderApp.running else { log("Finder not running"); return }
         if isAttached && finder.processIdentifier == finderPid { return }
         detach()
@@ -205,33 +224,41 @@ public final class FinderProgressWindowObserver {
         let pid = finder.processIdentifier
         let app = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(app, Self.messagingTimeout)
-
         var obs: AXObserver?
         guard AXObserverCreate(pid, axCallback, &obs) == .success, let obs else {
             log("AXObserverCreate failed, retrying"); scheduleAttach(after: 1); return
         }
-        let refcon = Unmanaged.passUnretained(self).toOpaque()
-        var ok = true
-        for n in [kAXWindowCreatedNotification, kAXValueChangedNotification,
-                  kAXFocusedWindowChangedNotification, kAXMainWindowChangedNotification] {
-            let err = AXObserverAddNotification(obs, app, n as CFString, refcon)
-            if err != .success && err != .notificationAlreadyRegistered {
-                log("add \(n) on app failed: \(err.rawValue)")
-                if n == kAXWindowCreatedNotification { ok = false }
+        // Registering talks to Finder (IPC): do it off the main thread.
+        attachInFlight = true
+        let refcon = UncheckedBox(Unmanaged.passUnretained(self).toOpaque())
+        let box = UncheckedBox((obs, app))
+        axQueue.async { [weak self] in
+            var ok = true
+            for n in [kAXWindowCreatedNotification, kAXValueChangedNotification,
+                      kAXFocusedWindowChangedNotification, kAXMainWindowChangedNotification] {
+                let err = AXObserverAddNotification(box.value.0, box.value.1, n as CFString, refcon.value)
+                if err != .success && err != .notificationAlreadyRegistered {
+                    WindowDiagnostics.log("observer", "add \(n) on app failed: \(err.rawValue)")
+                    if n == kAXWindowCreatedNotification { ok = false }
+                }
+            }
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.attachInFlight = false
+                    guard self.started else { return }
+                    // Typically kAXErrorCannotComplete right after Finder launches: retry.
+                    guard ok else { self.scheduleAttach(after: 1); return }
+                    CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(box.value.0), .commonModes)
+                    self.finderPid = pid
+                    self.appElement = box.value.1
+                    self.axObserver = box.value.0
+                    self.isAttached = true
+                    self.log("attached to Finder pid \(pid)")
+                    self.scanForProgressWindow()
+                }
             }
         }
-        guard ok else {
-            // Typically kAXErrorCannotComplete right after Finder launches.
-            scheduleAttach(after: 1); return
-        }
-        CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(obs), .commonModes)
-
-        finderPid = pid
-        appElement = app
-        axObserver = obs
-        isAttached = true
-        log("attached to Finder pid \(pid)")
-        scanForProgressWindow()
     }
 
     private func detach() {
@@ -244,48 +271,74 @@ public final class FinderProgressWindowObserver {
         appElement = nil
         finderPid = 0
         isAttached = false
+        generation += 1
     }
 
-    // MARK: Window tracking
+    // MARK: Window tracking (BUG-001: every AX read runs on `axQueue`, never on the main thread)
 
-    private func isProgressWindow(_ e: AXUIElement) -> Bool {
-        AX.string(e, kAXIdentifierAttribute) == Self.progressIdentifier
+    nonisolated private static func isProgressWindow(_ e: AXUIElement) -> Bool {
+        AX.string(e, kAXIdentifierAttribute) == progressIdentifier
     }
 
+    nonisolated private static let windowNotifications = [kAXMovedNotification, kAXResizedNotification, kAXUIElementDestroyedNotification,
+                                              kAXWindowMiniaturizedNotification, kAXWindowDeminiaturizedNotification]
+
+    /// Looks for Finder's Progress window. A failed window list changes nothing.
     private func scanForProgressWindow() {
-        guard let app = appElement, windowElement == nil else { return }
-        guard let wins = AX.windows(app) else { return }
-        if let w = wins.first(where: isProgressWindow) { track(w) }
+        guard let app = appElement, windowElement == nil, !scanInFlight else { return }
+        scanInFlight = true
+        let gen = generation
+        let box = UncheckedBox(app)
+        axQueue.async { [weak self] in
+            let wins = AX.windows(box.value)
+            let found = wins?.first(where: { Self.isProgressWindow($0) })
+            let result = UncheckedBox((wins == nil, found))
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.scanInFlight = false
+                    guard gen == self.generation else { return }
+                    if result.value.0 { self.log("scan: window list failed (kept state)") }
+                    if let w = result.value.1, self.windowElement == nil { self.track(w) }
+                }
+            }
+        }
     }
 
+    /// Starts tracking `w` (it has AXIdentifier "Progress"). The first read emits `.appeared`.
     private func track(_ w: AXUIElement) {
         guard let obs = axObserver else { return }
         if let cur = windowElement {
             if CFEqual(cur, w) { return }
             untrackWindow()
         }
-        let refcon = Unmanaged.passUnretained(self).toOpaque()
-        for n in [kAXMovedNotification, kAXResizedNotification, kAXUIElementDestroyedNotification,
-                  kAXWindowMiniaturizedNotification, kAXWindowDeminiaturizedNotification] {
-            let err = AXObserverAddNotification(obs, w, n as CFString, refcon)
-            if err != .success && err != .notificationAlreadyRegistered { log("add \(n) on window failed: \(err.rawValue)") }
-        }
         windowElement = w
-        guard let info = readInfo(w) else { untrackWindow(); return }
-        window = info
-        log("appeared: id=\(info.windowID.map(String.init) ?? "nil") frame=\(info.frame) rows=\(info.rowCount)")
-        emit(.appeared)
+        generation += 1
+        AXUIElementSetMessagingTimeout(w, Self.messagingTimeout)
+        let refcon = UncheckedBox(Unmanaged.passUnretained(self).toOpaque())
+        let box = UncheckedBox((obs, w))
+        axQueue.async {
+            for n in Self.windowNotifications {
+                let err = AXObserverAddNotification(box.value.0, box.value.1, n as CFString, refcon.value)
+                if err != .success && err != .notificationAlreadyRegistered {
+                    WindowDiagnostics.log("observer", "add \(n) on window failed: \(err.rawValue)")
+                }
+            }
+        }
+        reread(trigger: nil)
     }
 
     private func untrackWindow() {
         if let obs = axObserver, let w = windowElement {
-            for n in [kAXMovedNotification, kAXResizedNotification, kAXUIElementDestroyedNotification,
-                      kAXWindowMiniaturizedNotification, kAXWindowDeminiaturizedNotification] {
-                AXObserverRemoveNotification(obs, w, n as CFString)
+            let box = UncheckedBox((obs, w))
+            axQueue.async {
+                for n in Self.windowNotifications { AXObserverRemoveNotification(box.value.0, box.value.1, n as CFString) }
             }
         }
         windowElement = nil
-        rowRefreshPending = false
+        generation += 1
+        readInFlight = false; readPending = false; pendingTrigger = nil
+        consecutiveFailures = 0
         if window != nil {
             window = nil
             log("disappeared")
@@ -293,64 +346,151 @@ public final class FinderProgressWindowObserver {
         }
     }
 
-    /// Re-reads the tracked window and emits events for what changed.
+    /// Outcome of one background read of the tracked window.
+    private enum ReadResult {
+        /// The element is invalid: the window is really gone.
+        case gone
+        /// Finder didn't answer (timeout, kAXErrorCannotComplete, ...): keep everything we knew.
+        case failed(AXError)
+        case ok(RawInfo)
+    }
+
+    /// Values read on `axQueue`; nil fields failed to read and keep their previous value.
+    private struct RawInfo {
+        let axFrame: CGRect
+        let windowID: CGWindowID?
+        let rows: [Row]?
+        let isMinimized: Bool?
+        let isMain: Bool?
+    }
+
+    /// Re-reads the tracked window off the main thread and applies the result on the main thread.
+    /// Coalesced: while a read is in flight, further requests collapse into one follow-up read.
     private func reread(trigger: Event?) {
         guard let w = windowElement else { return }
-        guard let info = readInfo(w) else {
-            // The element is gone (Destroyed can be missed). Look for a replacement.
-            untrackWindow()
-            scanForProgressWindow()
+        if readInFlight {
+            readPending = true
+            if trigger == .orderingMayHaveChanged { pendingTrigger = trigger }
             return
         }
-        let old = window
-        window = info
-        guard let old else { emit(.appeared); return }
-        var events: [Event] = []
-        if old.axFrame.origin != info.axFrame.origin { events.append(.moved) }
-        if old.axFrame.size != info.axFrame.size { events.append(.resized) }
-        if old.isMinimized != info.isMinimized { events.append(.minimizedChanged) }
-        if old.isActive != info.isActive { events.append(.activationChanged) }
-        if old.rows != info.rows { events.append(.rowsChanged) }
-        if events.isEmpty, let trigger, trigger == .orderingMayHaveChanged { events.append(trigger) }
-        if old.windowID != info.windowID && !events.contains(.orderingMayHaveChanged) { events.append(.orderingMayHaveChanged) }
-        for e in events { emit(e) }
+        readInFlight = true
+        let gen = generation, pid = finderPid
+        let box = UncheckedBox(w)
+        axQueue.async { [weak self] in
+            let t0 = Date()
+            let result = UncheckedBox(Self.read(box.value, pid: pid))
+            let ms = Date().timeIntervalSince(t0) * 1000
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    guard gen == self.generation else { return }   // untracked/detached meanwhile
+                    self.readInFlight = false
+                    if ms > 250 { self.log(String(format: "read took %.0f ms", ms)) }
+                    self.apply(result.value, trigger: trigger)
+                    if self.readPending, self.windowElement != nil {
+                        let t = self.pendingTrigger
+                        self.readPending = false; self.pendingTrigger = nil
+                        self.reread(trigger: t)
+                    }
+                }
+            }
+        }
     }
 
-    private func readInfo(_ w: AXUIElement) -> WindowInfo? {
+    private func apply(_ result: ReadResult, trigger: Event?) {
+        switch result {
+        case .gone:
+            log("read: element invalid -> window gone")
+            untrackWindow()
+            scanForProgressWindow()
+        case .failed(let err):
+            consecutiveFailures += 1
+            log("read failed (\(err.rawValue)), keeping last info (\(consecutiveFailures) in a row)")
+            if window != nil, trigger == .orderingMayHaveChanged { emit(.orderingMayHaveChanged) }
+        case .ok(let raw):
+            consecutiveFailures = 0
+            let old = window
+            if let m = raw.isMain { lastIsMain = m }
+            let wid = raw.windowID ?? old?.windowID ?? CGWindows.finderWindowID(matching: raw.axFrame, pid: finderPid)
+            let info = WindowInfo(
+                windowID: wid,
+                frame: ScreenGeometry.appKitRect(fromTopLeft: raw.axFrame),
+                axFrame: raw.axFrame,
+                rows: raw.rows ?? old?.rows ?? [],
+                isMinimized: raw.isMinimized ?? old?.isMinimized ?? false,
+                isActive: NSWorkspace.shared.frontmostApplication?.processIdentifier == finderPid && lastIsMain
+            )
+            window = info
+            guard let old else {
+                log("appeared: id=\(info.windowID.map(String.init) ?? "nil") frame=\(info.frame) rows=\(info.rowCount)")
+                emit(.appeared)
+                return
+            }
+            var events: [Event] = []
+            if old.axFrame.origin != info.axFrame.origin { events.append(.moved) }
+            if old.axFrame.size != info.axFrame.size { events.append(.resized) }
+            if old.isMinimized != info.isMinimized { events.append(.minimizedChanged) }
+            if old.isActive != info.isActive { events.append(.activationChanged) }
+            if old.rows != info.rows { events.append(.rowsChanged) }
+            if events.isEmpty, trigger == .orderingMayHaveChanged { events.append(.orderingMayHaveChanged) }
+            if old.windowID != info.windowID && !events.contains(.orderingMayHaveChanged) { events.append(.orderingMayHaveChanged) }
+            for e in events { emit(e) }
+        }
+    }
+
+    /// Runs on `axQueue`. Only kAXErrorInvalidUIElement means "gone".
+    nonisolated private static func read(_ w: AXUIElement, pid: pid_t) -> ReadResult {
         var role: AnyObject?
-        let err = AXUIElementCopyAttributeValue(w, kAXRoleAttribute as CFString, &role)
-        if err == .invalidUIElement { return nil }
-        guard let axFrame = AX.frame(w) else { return err == .success ? window : nil }
-        let wid = AX.windowID(w) ?? window?.windowID ?? CGWindows.finderWindowID(matching: axFrame, pid: finderPid)
-        return WindowInfo(
-            windowID: wid,
-            frame: ScreenGeometry.appKitRect(fromTopLeft: axFrame),
-            axFrame: axFrame,
-            rows: readRows(w),
-            isMinimized: AX.bool(w, kAXMinimizedAttribute) ?? false,
-            isActive: NSWorkspace.shared.frontmostApplication?.processIdentifier == finderPid
-                && (AX.bool(w, kAXMainAttribute) ?? false)
-        )
+        let err = AX.copy(w, kAXRoleAttribute, &role)
+        if err == .invalidUIElement { return .gone }
+        if err != .success { return .failed(err) }
+        guard let axFrame = AX.frame(w) else { return .failed(.cannotComplete) }
+        return .ok(RawInfo(axFrame: axFrame, windowID: AX.windowID(w), rows: readRows(w),
+                           isMinimized: AX.bool(w, kAXMinimizedAttribute), isMain: AX.bool(w, kAXMainAttribute)))
     }
 
-    /// Rows by element order: each AXProgressIndicator starts a row; its title is the last
-    /// static text before it, its status the first static text after it.
-    private func readRows(_ w: AXUIElement) -> [Row] {
-        let container = AX.children(w).first { AX.string($0, kAXRoleAttribute) == kAXScrollAreaRole as String } ?? w
-        let elements = AX.flattenedDescendants(container, maxDepth: 4)
+    /// Runs on `axQueue`. Rows by element order: each AXProgressIndicator starts a row; its title is
+    /// the last static text before it, its status the first static text after it. Returns nil if any
+    /// read failed (the caller keeps the previous rows instead of publishing partial ones).
+    nonisolated private static func readRows(_ w: AXUIElement) -> [Row]? {
+        func attr(_ e: AXUIElement, _ name: String) -> (AXError, AnyObject?) {
+            var v: AnyObject?; let err = AX.copy(e, name, &v); return (err, v)
+        }
+        let (ce, cv) = attr(w, kAXChildrenAttribute)
+        guard ce == .success, let top = cv as? [AXUIElement] else { return nil }
+        var container = w
+        for c in top {
+            let (re, rv) = attr(c, kAXRoleAttribute)
+            guard re == .success || re == .noValue else { return nil }
+            if rv as? String == kAXScrollAreaRole as String { container = c; break }
+        }
+        var elements: [AXUIElement] = []
+        var failed = false
+        func walk(_ e: AXUIElement, _ depth: Int) {
+            let (err, v) = attr(e, kAXChildrenAttribute)
+            if err != .success && err != .noValue && err != .attributeUnsupported { failed = true; return }
+            for c in (v as? [AXUIElement]) ?? [] {
+                elements.append(c)
+                if depth < 4 { walk(c, depth + 1) }
+            }
+        }
+        walk(container, 1)
+        if failed { return nil }
         var rows: [(title: String, status: String?, fraction: Double?)] = []
         var pendingText: String?
         for e in elements {
-            switch AX.string(e, kAXRoleAttribute) {
+            let (re, rv) = attr(e, kAXRoleAttribute)
+            guard re == .success || re == .noValue else { return nil }
+            switch rv as? String {
             case kAXStaticTextRole?:
-                let text = AX.string(e, kAXValueAttribute) ?? ""
-                if let last = rows.indices.last, rows[last].status == nil {
-                    rows[last].status = text
-                } else {
-                    pendingText = text
-                }
+                let (ve, vv) = attr(e, kAXValueAttribute)
+                guard ve == .success || ve == .noValue else { return nil }
+                let text = vv as? String ?? ""
+                if let last = rows.indices.last, rows[last].status == nil { rows[last].status = text } else { pendingText = text }
             case kAXProgressIndicatorRole?:
-                rows.append((pendingText ?? "", nil, AX.double(e, kAXValueAttribute)))
+                let (ve, vv) = attr(e, kAXValueAttribute)
+                guard ve == .success || ve == .noValue else { return nil }
+                rows.append((pendingText ?? "", nil, (vv as? NSNumber)?.doubleValue))
                 pendingText = nil
             default:
                 break
@@ -364,16 +504,30 @@ public final class FinderProgressWindowObserver {
         }
     }
 
-    private func scheduleRowRefresh() {
-        guard !rowRefreshPending else { return }
-        rowRefreshPending = true
-        DispatchQueue.main.async { [weak self] in
-            MainActor.assumeIsolated {
-                guard let self, self.rowRefreshPending else { return }
-                self.rowRefreshPending = false
-                self.reread(trigger: nil)
+    /// A SUCCESSFUL window list without our element means the window is gone (BUG-001 (a)).
+    private func verifyTracked() {
+        guard let app = appElement, let w = windowElement, !verifyInFlight else { return }
+        verifyInFlight = true
+        let gen = generation
+        let box = UncheckedBox((app, w))
+        axQueue.async { [weak self] in
+            let wins = AX.windows(box.value.0)
+            let missing = wins.map { list in !list.contains(where: { CFEqual($0, box.value.1) }) } ?? false
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.verifyInFlight = false
+                    guard gen == self.generation, missing else { return }
+                    self.log("window list no longer contains the Progress window -> gone")
+                    self.untrackWindow()
+                    self.scanForProgressWindow()
+                }
             }
         }
+    }
+
+    private func scheduleRowRefresh() {
+        reread(trigger: nil)   // coalesced in reread
     }
 
     private func emitOrderingHint() {
@@ -382,9 +536,10 @@ public final class FinderProgressWindowObserver {
     }
 
     /// Activation or focus changed somewhere: re-read (isActive may have changed) and let the panel
-    /// re-check its ordering.
+    /// re-check its ordering right away (the read result follows).
     private func focusMayHaveChanged() {
         guard windowElement != nil else { return }
+        emitOrderingHint()
         reread(trigger: .orderingMayHaveChanged)
     }
 
@@ -395,38 +550,62 @@ public final class FinderProgressWindowObserver {
             return
         }
         if let f = FinderApp.running, f.processIdentifier != finderPid { attach(); return }
-        if windowElement == nil { scanForProgressWindow() } else { reread(trigger: .orderingMayHaveChanged) }
+        if windowElement == nil { scanForProgressWindow() } else { reread(trigger: .orderingMayHaveChanged); verifyTracked() }
     }
 
-    // MARK: AX callback
+    // MARK: AX callback (main thread; no AX calls here, only scheduling)
 
     fileprivate func handle(notification: String, element: AXUIElement) {
         switch notification {
-        case kAXWindowCreatedNotification:
-            if isProgressWindow(element) { track(element) }
+        case kAXWindowCreatedNotification, kAXFocusedWindowChangedNotification, kAXMainWindowChangedNotification:
+            if windowElement == nil { checkCandidate(element) }
+            if notification != kAXWindowCreatedNotification { focusMayHaveChanged() }
         case kAXValueChangedNotification:
-            guard let wv = AX.attribute(element, kAXWindowAttribute), CFGetTypeID(wv) == AXUIElementGetTypeID() else { return }
-            let win = wv as! AXUIElement
-            if let cur = windowElement, CFEqual(cur, win) {
-                scheduleRowRefresh()
-            } else if windowElement == nil, isProgressWindow(win) {
-                track(win)   // missed the creation
-            }
+            if windowElement != nil { scheduleRowRefresh() } else { checkCandidate(element, viaWindowAttribute: true) }
         case kAXMovedNotification, kAXResizedNotification,
              kAXWindowMiniaturizedNotification, kAXWindowDeminiaturizedNotification:
             reread(trigger: nil)
         case kAXUIElementDestroyedNotification:
-            if let cur = windowElement, CFEqual(cur, element) || readInfo(cur) == nil {
+            if let cur = windowElement, CFEqual(cur, element) {
+                log("destroyed notification -> window gone")
                 untrackWindow()
                 scanForProgressWindow()
+            } else {
+                reread(trigger: nil)   // a read reports .gone if it was ours
             }
-        case kAXFocusedWindowChangedNotification, kAXMainWindowChangedNotification:
-            if windowElement == nil, isProgressWindow(element) { track(element) }
-            focusMayHaveChanged()
         default:
             break
         }
     }
+
+    /// Checks off the main thread whether `element` (or its window) is the Progress window.
+    private func checkCandidate(_ element: AXUIElement, viaWindowAttribute: Bool = false) {
+        let gen = generation
+        let box = UncheckedBox(element)
+        axQueue.async { [weak self] in
+            var candidate: AXUIElement? = box.value
+            if viaWindowAttribute {
+                if let v = AX.attribute(box.value, kAXWindowAttribute), CFGetTypeID(v) == AXUIElementGetTypeID() {
+                    candidate = (v as! AXUIElement)
+                } else { candidate = nil }
+            }
+            guard let c = candidate, Self.isProgressWindow(c) else { return }
+            let found = UncheckedBox(c)
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    guard let self, gen == self.generation, self.windowElement == nil else { return }
+                    self.track(found.value)
+                }
+            }
+        }
+    }
+}
+
+/// Moves non-Sendable CF references between the main thread and `axQueue`. AXUIElement and
+/// AXObserver are thread-safe CF types.
+private struct UncheckedBox<T>: @unchecked Sendable {
+    let value: T
+    init(_ v: T) { value = v }
 }
 
 private func axCallback(_ observer: AXObserver, _ element: AXUIElement, _ notification: CFString,

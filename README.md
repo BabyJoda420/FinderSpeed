@@ -16,14 +16,13 @@ See [docs/visual-design.md](docs/visual-design.md) for the **Before vs. After** 
 
 ## Install
 
-1. Download `FinderSpeed.zip` from the [GitHub Releases page](https://github.com/BabyJoda420/FinderSpeed/releases).
-2. Unzip the archive and move `FinderSpeed.app` into `/Applications`.
-3. **First launch (notarization bypass):** Because this test release is ad-hoc signed and not notarized, macOS blocks opening it by default. To allow it:
+1. Download `FinderSpeed.dmg` from the [Releases page](https://github.com/BabyJoda420/FinderSpeed/releases), open it, and drag FinderSpeed onto the Applications folder. *(Alternatively, download `FinderSpeed.zip` and extract `FinderSpeed.app` into `/Applications`.)*
+2. **First launch (notarization bypass):** Because this test release is ad-hoc signed and not notarized, macOS blocks opening it by default (including when installed from the DMG). To allow it:
    - Run in Terminal: `xattr -dr com.apple.quarantine /Applications/FinderSpeed.app`, or
    - Right-click `FinderSpeed.app` → **Open**, or
    - Go to **System Settings → Privacy & Security** and click **Open Anyway**.
-4. **Grant Accessibility:** When prompted, grant Accessibility access in **System Settings → Privacy & Security → Accessibility → FinderSpeed** (required to attach to Finder's progress window).
-5. **Launch at Login (optional):** Click the speedometer icon in the menu bar and select **Launch at Login** to start FinderSpeed automatically.
+3. **Grant Accessibility:** When prompted, grant Accessibility access in **System Settings → Privacy & Security → Accessibility → FinderSpeed** (required to attach to Finder's progress window).
+4. **Launch at Login (optional):** Click the speedometer icon in the menu bar and select **Launch at Login** to start FinderSpeed automatically.
 
 > [!NOTE]
 > - **Compatibility:** Requires macOS 14.0 or later; universal build runs natively on Apple Silicon and Intel Macs.
@@ -53,6 +52,7 @@ open build/FinderSpeed.app
 ```
 
 - Pass `debug` or `release` to `scripts/build-app.sh` (defaults to `release`).
+- Use `scripts/build-app.sh --universal` for Apple Silicon + Intel (`arm64` + `x86_64`), `--zip` to create `build/FinderSpeed-<version>.zip`, or `scripts/build-app.sh --dmg` to create the drag-to-Applications DMG installer (`build/FinderSpeed-<version>.dmg`).
 - `FinderSpeed.app` runs as an accessory menu bar app (`LSUIElement = true`, no Dock icon). Click the speedometer icon in the menu bar to inspect active copies, check Accessibility status, open the standalone **Show Demo Panel** (`⌘D`), or quit (`⌘Q`).
 
 ---
@@ -86,6 +86,22 @@ Run the binary directly (`.build/release/FinderSpeed` or `build/FinderSpeed.app/
   ```bash
   .build/release/FinderSpeed --render-demo build/snapshots
   ```
+
+### Diagnostics
+
+Diagnostic pre-release builds (such as `0.1.1-diag`) automatically write a detailed diagnostic log to:
+```bash
+~/Library/Logs/FinderSpeed.log
+```
+
+To enable this diagnostic log in normal release builds:
+```bash
+defaults write com.mauriziolol.finderspeed FinderSpeedDebugWindow -bool YES
+```
+To turn it off:
+```bash
+defaults write com.mauriziolol.finderspeed FinderSpeedDebugWindow -bool NO
+```
 
 ---
 

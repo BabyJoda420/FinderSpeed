@@ -31,9 +31,16 @@ public final class TransferMonitor: ObservableObject {
     public var smoothingTimeConstant: TimeInterval = 1.5
     /// Finder's nominal counter cadence. Caps the first interval after "preparing".
     public var nominalCadence: TimeInterval = 0.5
-    /// With no counter change for this long, the copy counts as stalled: a 0 sample is emitted
-    /// every `nominalCadence`.
+    /// Minimum time without a counter change before a copy counts as stalled (then a 0 sample is
+    /// emitted every `nominalCadence`). The real threshold is adaptive, see `stallFactor`.
     public var stallThreshold: TimeInterval = 2.0
+    /// BUG-001: Finder's counter moves in 8 MiB granules, so a slow copy (3.4 MB/s to a USB HDD)
+    /// only changes every ~2.5 s, and per-file updates can be sparser still. Each copy's update
+    /// interval is learned (median of its recent intervals); it only counts as stalled after
+    /// `stallFactor` x that interval (and at least `stallThreshold`). Until then the last rate is held.
+    public var stallFactor: Double = 3.0
+    /// Stall threshold before a copy's cadence is known (until its first interval is measured).
+    public var initialStallAfter: TimeInterval = 5.0
     /// Segments shorter than this are not turned into samples: their bytes roll into the next
     /// segment, or are dropped from the graph if it was the final one. Our timestamps are poll
     /// times (0.1 s granularity), so a short segment would amplify that error into a spike.
@@ -325,6 +332,9 @@ public final class TransferMonitor: ObservableObject {
         var total: Int64 = -1
         var lastBytes: Int64 = -2          // -2 = never read
         var lastChangeAt: Date
+        var intervals = UpdateIntervals()  // learned Finder update cadence for this item
+        var inStall = false                // a stall zero was emitted since the last change
+        var lastRealRate: Double = 0       // the last measured (non-stall) rate
         var lastSampleAt: Date
         var rate: Double = 0               // the latest raw bytes/sec of this item
         var copyStartedAt: Date?           // estimated start of the first timed interval
@@ -356,6 +366,9 @@ public final class TransferMonitor: ObservableObject {
         var windowBytes: Int64?            // latest "X of Y" count from Finder's window row
         var windowTotal: Int64?
         var windowChangedAt: Date?
+        var windowIntervals = UpdateIntervals()
+        var windowInStall = false
+        var windowLastRealRate: Double = 0
         var windowFirst: (bytes: Int64, at: Date)?
         var windowHistory = RateHistory()
         var windowSampledAt: Date?
@@ -504,6 +517,16 @@ public final class TransferMonitor: ObservableObject {
             return false
         }
         if h.bytes != h.lastBytes {
+            // Learn the cadence from normal gaps only. A gap that was shown as a stall is still
+            // learned if the bytes that arrive with it show copying went on (>= 50 % of the recent
+            // rate): then Finder's counter was just quiet. A genuine pause is not learned, so it
+            // can't hide the next one.
+            if h.lastBytes > 0, h.bytes > h.lastBytes, h.primed {
+                let gap = now.timeIntervalSince(h.lastChangeAt)
+                let gapRate = Double(h.bytes - h.lastBytes) / max(gap, 0.001)
+                if !h.inStall || gapRate >= 0.5 * h.lastRealRate { h.intervals.record(gap) }
+            }
+            h.inStall = false
             h.lastBytes = h.bytes; h.lastChangeAt = now
             guard h.bytes > 0 else {           // -1 -> 0: still preparing
                 h.lastSampleAt = now; h.history = RateHistory()
@@ -539,14 +562,16 @@ public final class TransferMonitor: ObservableObject {
             }
             guard h.history.span >= rawRateWindow * 0.8, let r = h.history.rate else { return false }
             h.rate = r
+            h.lastRealRate = r
             h.lastSampleAt = now
             return true
         }
         // No change: after a stall, emit 0 samples at the nominal cadence.
         if h.bytes > 0, h.primed, !h.unpublished,
-           now.timeIntervalSince(h.lastChangeAt) >= stallThreshold,
+           now.timeIntervalSince(h.lastChangeAt) >= stallAfter(h.intervals),
            now.timeIntervalSince(h.lastSampleAt) >= nominalCadence {
             h.rate = 0                         // display only: the history is not touched
+            h.inStall = true
             h.lastSampleAt = now
             return true
         }
@@ -558,13 +583,16 @@ public final class TransferMonitor: ObservableObject {
         let unfiltered = override ?? s.handles.reduce(0.0) { $0 + $1.rate }
         if let last = s.samples.last, last.time >= now { return false }
         let raw: Double
-        if medianWidth > 1 {
+        if unfiltered == 0 {
+            // A 0 only comes from a real stall: a deliberate signal, shown at once. It does NOT
+            // enter the median's history, or it would suppress the real rates around it
+            // (BUG-001: median of [0, 3.4, 0, 3.4, 0] MB/s = 0, so the graph was all zeros).
+            raw = 0
+        } else if medianWidth > 1 {
             s.rawRecent.append(unfiltered)
             if s.rawRecent.count > medianWidth { s.rawRecent.removeFirst() }
             let sorted = s.rawRecent.sorted()
-            // A 0 only comes from a stall (no bytes for >= stallThreshold): a deliberate signal, not
-            // noise, so it is shown at once (and still enters the median's history).
-            raw = unfiltered == 0 ? 0 : sorted[(sorted.count - 1) / 2]   // lower median while filling up
+            raw = sorted[(sorted.count - 1) / 2]   // lower median while filling up
         } else {
             raw = unfiltered
         }
@@ -579,6 +607,12 @@ public final class TransferMonitor: ObservableObject {
         }
         s.lastSampleAt = now
         return true
+    }
+
+    /// No counter change for this long = a real stall (adaptive, BUG-001).
+    private func stallAfter(_ i: UpdateIntervals) -> TimeInterval {
+        guard let learned = i.learned, let longest = i.longest else { return max(stallThreshold, initialStallAfter) }
+        return max(stallThreshold, stallFactor * learned, 1.5 * longest)
     }
 
     // MARK: Finder window fallback
@@ -618,6 +652,12 @@ public final class TransferMonitor: ObservableObject {
               let s = windowRowState(destination: destination, name: destinationName) else { return }
         if let bytesTotal, bytesTotal > 0 { s.windowTotal = bytesTotal }
         if s.windowBytes != bytesCompleted {
+            if let prev = s.windowBytes, bytesCompleted > prev, let at = s.windowChangedAt {
+                let gap = timestamp.timeIntervalSince(at)
+                let gapRate = Double(bytesCompleted - prev) / max(gap, 0.001)
+                if !s.windowInStall || gapRate >= 0.5 * s.windowLastRealRate { s.windowIntervals.record(gap) }
+            }
+            s.windowInStall = false
             s.windowBytes = bytesCompleted
             s.windowChangedAt = timestamp
             if s.windowFirst == nil { s.windowFirst = (bytesCompleted, timestamp) }
@@ -629,6 +669,7 @@ public final class TransferMonitor: ObservableObject {
                 if timestamp.timeIntervalSince(s.windowSampledAt ?? .distantPast) >= minSegment,
                    s.windowHistory.span >= rawRateWindow * 0.8,
                    let r = s.windowHistory.rate, emitSample(s, now: timestamp, raw: r) {
+                    s.windowLastRealRate = r
                     s.windowSampledAt = timestamp
                 }
             } else {
@@ -671,6 +712,8 @@ public final class TransferMonitor: ObservableObject {
                 s.windowAheadSince = since
                 if now.timeIntervalSince(since) >= windowSwitchDelay {
                     s.usesWindowBytes = true
+                    // New speed source: don't carry over an EMA that the frozen NSProgress decayed.
+                    s.emaInitialized = false; s.rawRecent = []
                     ev("window fallback ON \(tag(s)) window=\(wb) ns=\(s.bytesCompleted)")
                 }
             } else {
@@ -678,9 +721,10 @@ public final class TransferMonitor: ObservableObject {
             }
             return
         }
-        if let changed = s.windowChangedAt, now.timeIntervalSince(changed) >= stallThreshold,
+        if let changed = s.windowChangedAt, now.timeIntervalSince(changed) >= stallAfter(s.windowIntervals),
            now.timeIntervalSince(s.windowSampledAt ?? changed) >= nominalCadence {
             emitSample(s, now: now, raw: 0)    // display only: windowHistory is not touched
+            s.windowInStall = true
             s.windowSampledAt = now
         }
     }
@@ -807,6 +851,26 @@ private final class WeakMonitor: @unchecked Sendable {
 private struct UncheckedBox<T>: @unchecked Sendable {
     let value: T
     init(_ v: T) { value = v }
+}
+
+/// Recent intervals between real counter changes; `learned` is their median (robust to a single
+/// long pause or a burst).
+struct UpdateIntervals {
+    private(set) var recent: [TimeInterval] = []
+    mutating func record(_ dt: TimeInterval) {
+        guard dt > 0 else { return }
+        recent.append(dt)
+        if recent.count > Self.memory { recent.removeFirst() }
+    }
+    /// How many recent intervals the median runs over.
+    static let memory = 20
+    /// The longest recent normal gap: a gap that long is evidently part of this copy's rhythm.
+    var longest: TimeInterval? { recent.max() }
+    var learned: TimeInterval? {
+        guard !recent.isEmpty else { return nil }
+        let s = recent.sorted()
+        return s[s.count / 2]
+    }
 }
 
 /// Real counter observations used for windowed raw rates. Keeps the newest point that is at least

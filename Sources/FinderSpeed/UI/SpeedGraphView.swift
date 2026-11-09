@@ -1,7 +1,7 @@
 // UI/SpeedGraphView.swift (owner: thor)
 // Swift Charts throughput graph in Finder's text column (width 311, height 64, no box or border).
-// Uses percent-complete (0...1) on the X-axis when bytesTotal and sample.bytesCompleted are known,
-// so the curve's right edge aligns with Finder's progress bar fill above it; falls back to time otherwise.
+// Uses a TIME x-axis that always spans full width from the first sample to the latest sample.
+// For transfers with fewer than 3 samples, shows a compact 'measuring' placeholder line instead of a sliver.
 
 import Charts
 import SwiftUI
@@ -10,7 +10,6 @@ public struct SpeedGraphView: View {
     public let samples: [SpeedSample]
     public var bytesTotal: Int64
     public var averageBytesPerSecond: Double?
-    public var maxWindowSeconds: TimeInterval
     public var chartHeight: CGFloat
 
     @Environment(\.colorScheme) private var colorScheme
@@ -25,7 +24,6 @@ public struct SpeedGraphView: View {
         self.samples = samples
         self.bytesTotal = bytesTotal
         self.averageBytesPerSecond = averageBytesPerSecond
-        self.maxWindowSeconds = maxWindowSeconds
         self.chartHeight = chartHeight
     }
 
@@ -49,62 +47,8 @@ public struct SpeedGraphView: View {
         let mbPerSecond: Double
     }
 
-    private struct PercentPlotPoint: Identifiable {
-        let id: Int
-        let fraction: Double
-        let mbPerSecond: Double
-    }
-
-    /// True when `bytesTotal` is known (> 0) and every sample carries a positive `bytesCompleted`.
-    private var usesPercentAxis: Bool {
-        bytesTotal > 0 && !samples.isEmpty && samples.allSatisfy { $0.bytesCompleted > 0 }
-    }
-
-    /// Samples mapped to `0...1` fraction complete when `usesPercentAxis` is true.
-    private var percentPoints: [PercentPlotPoint] {
-        guard usesPercentAxis else { return [] }
-        let total = Double(bytesTotal)
-        var result: [PercentPlotPoint] = []
-        result.reserveCapacity(samples.count + 1)
-
-        if let first = samples.first {
-            let firstFrac = min(1.0, max(0.0, Double(first.bytesCompleted) / total))
-            let firstMBps = max(0, first.bytesPerSecond) / 1_000_000
-            if firstFrac > 0.0001 {
-                result.append(PercentPlotPoint(id: 0, fraction: 0.0, mbPerSecond: firstMBps))
-            }
-        }
-
-        var lastFraction: Double = -1.0
-        for (idx, sample) in samples.enumerated() {
-            var frac = min(1.0, max(0.0, Double(sample.bytesCompleted) / total))
-            if frac <= lastFraction {
-                frac = min(1.0, lastFraction + 0.00001)
-            }
-            lastFraction = frac
-            let mbps = max(0, sample.bytesPerSecond) / 1_000_000
-            result.append(PercentPlotPoint(id: idx + 1, fraction: frac, mbPerSecond: mbps))
-        }
-        return result
-    }
-
-    /// Fallback: samples trimmed to the last `maxWindowSeconds` (default 120 s), converted to decimal MB/s.
-    private var windowedTimePoints: [TimePlotPoint] {
-        guard let last = samples.last else { return [] }
-        let cutoff = last.time.addingTimeInterval(-maxWindowSeconds)
-        let filtered = samples.filter { $0.time >= cutoff }
-        guard !filtered.isEmpty else { return [] }
-
-        if filtered.count == 1, let only = filtered.first {
-            let start = only.time.addingTimeInterval(-0.5)
-            let mbps = max(0, only.bytesPerSecond) / 1_000_000
-            return [
-                TimePlotPoint(id: 0, time: start, mbPerSecond: mbps),
-                TimePlotPoint(id: 1, time: only.time, mbPerSecond: mbps),
-            ]
-        }
-
-        return filtered.enumerated().map { idx, sample in
+    private var timePoints: [TimePlotPoint] {
+        samples.enumerated().map { idx, sample in
             TimePlotPoint(
                 id: idx,
                 time: sample.time,
@@ -113,22 +57,15 @@ public struct SpeedGraphView: View {
         }
     }
 
-    private var activeMBpsValues: [Double] {
-        if usesPercentAxis {
-            return samples.map { max(0, $0.bytesPerSecond) / 1_000_000 }
-        }
-        return windowedTimePoints.map(\.mbPerSecond)
-    }
-
     private var peakMBps: Double {
-        activeMBpsValues.max() ?? 0
+        samples.map { max(0, $0.bytesPerSecond) / 1_000_000 }.max() ?? 0
     }
 
     private var averageMBps: Double? {
         if let explicit = averageBytesPerSecond, explicit > 0 {
             return explicit / 1_000_000
         }
-        let nonZero = activeMBpsValues.filter { $0 > 0 }
+        let nonZero = samples.map { max(0, $0.bytesPerSecond) / 1_000_000 }.filter { $0 > 0 }
         guard !nonZero.isEmpty else { return nil }
         return nonZero.reduce(0, +) / Double(nonZero.count)
     }
@@ -153,61 +90,26 @@ public struct SpeedGraphView: View {
     }
 
     private var timeXDomain: ClosedRange<Date>? {
-        guard let first = windowedTimePoints.first?.time,
-              let last = windowedTimePoints.last?.time else {
+        guard let first = samples.first?.time,
+              let last = samples.last?.time else {
             return nil
         }
-        let span = max(5.0, min(maxWindowSeconds, last.timeIntervalSince(first)))
-        return first...first.addingTimeInterval(span)
+        return first < last ? first...last : first...first.addingTimeInterval(0.001)
     }
 
     public var body: some View {
-        let yMax = yDomainMax
-
-        if usesPercentAxis {
-            let pts = percentPoints
-            if !pts.isEmpty {
-                Chart {
-                    ForEach(pts) { pt in
-                        AreaMark(
-                            x: .value("Progress", pt.fraction),
-                            yStart: .value("Baseline", 0),
-                            yEnd: .value("Speed (MB/s)", pt.mbPerSecond)
-                        )
-                        .interpolationMethod(.catmullRom)
-                        .foregroundStyle(areaGradient)
-
-                        LineMark(
-                            x: .value("Progress", pt.fraction),
-                            y: .value("Speed (MB/s)", pt.mbPerSecond)
-                        )
-                        .interpolationMethod(.catmullRom)
-                        .lineStyle(StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round))
-                        .foregroundStyle(Color.accentColor)
-                    }
-
-                    if let avg = averageMBps, avg > 0 {
-                        RuleMark(y: .value("Avg", avg))
-                            .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 3]))
-                            .foregroundStyle(Color.secondary.opacity(0.65))
-                    }
-                }
-                .chartYScale(domain: 0...yMax)
-                .chartXScale(domain: 0.0...1.0)
-                .chartXAxis(.hidden)
-                .chartYAxis {
-                    AxisMarks(values: [0, yMax / 2, yMax]) { _ in
-                        AxisGridLine(stroke: StrokeStyle(lineWidth: 0.5))
-                            .foregroundStyle(Color.primary.opacity(0.08))
-                    }
-                }
-                .frame(height: chartHeight)
+        if samples.count < 3 {
+            Text("Measuring…")
+                .font(.system(size: 11, weight: .regular))
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(height: 24)
                 .accessibilityElement(children: .ignore)
-                .accessibilityLabel(accessibilitySummary)
-            }
+                .accessibilityLabel("Measuring throughput")
         } else {
-            let pts = windowedTimePoints
-            if !pts.isEmpty {
+            let pts = timePoints
+            let yMax = yDomainMax
+            if let xDomain = timeXDomain {
                 Chart {
                     ForEach(pts) { pt in
                         AreaMark(
@@ -234,7 +136,7 @@ public struct SpeedGraphView: View {
                     }
                 }
                 .chartYScale(domain: 0...yMax)
-                .chartXScale(domain: timeXDomain ?? Date()...Date().addingTimeInterval(5))
+                .chartXScale(domain: xDomain)
                 .chartXAxis(.hidden)
                 .chartYAxis {
                     AxisMarks(values: [0, yMax / 2, yMax]) { _ in

@@ -4,10 +4,20 @@ All notable changes to **finder-speed** will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.1-diag] - 2026-11-09 (pre-release)
+
+- **BUG-001 fixes & diagnostic pre-release:**
+  - **Window stability (`apollo`, `BUG-001.md`):** Moved all AX reads off the main thread to prevent UI lockups and freezing fades during busy operations. Transient AX timeouts and errors are no longer treated as "window gone", eliminating panel flapping. Replaced main-thread alpha animation with a stall-proof fade. Split the cap band into distinct corner and strip subviews to prevent full-width band visual glitches. Added Retina-scale chrome rendering.
+  - **Engine cadence adaptation (`athena`, `BUG-001-engine.md`):** TransferMonitor now learns Finder's real byte counter update interval per transfer (adapting to 8 MiB granular updates on slow drives or USB disks) so slow transfers no longer decay to near 0 KB/s. Real calculation for average and peak throughput.
+  - **UI & Graph (`thor`):** Restored the speed graph to a full-width time axis.
+  - **Packaging & Assets (`zeus`):** Added the new Icon Composer macOS application icon and the drag-to-Applications DMG installer (`FinderSpeed.dmg`).
+  - **Diagnostics:** Enabled diagnostic logging by default in diagnostic builds, writing to `~/Library/Logs/FinderSpeed.log`.
+
 ## [0.1.0] - 2026-11-09
 
 - **First test release (v0.1.0):**
   - Distributed as a universal binary (`arm64` + `x86_64`) supporting macOS 14+ on Apple Silicon and Intel Macs.
+  - Added DMG installer (`FinderSpeed.dmg`) with drag-to-Applications layout.
   - Added "Launch at Login" menu bar option for automatic startup.
   - Released under the MIT license.
 

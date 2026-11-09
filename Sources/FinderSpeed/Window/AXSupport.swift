@@ -12,7 +12,42 @@ func _AXUIElementGetWindow(_ element: AXUIElement, _ wid: UnsafeMutablePointer<C
 enum AX {
     static func attribute(_ e: AXUIElement, _ name: String) -> AnyObject? {
         var v: AnyObject?
-        return AXUIElementCopyAttributeValue(e, name as CFString, &v) == .success ? v : nil
+        return copy(e, name, &v) == .success ? v : nil
+    }
+
+    /// AXUIElementCopyAttributeValue, timed: slow calls and real failures go to the diagnostic log
+    /// (BUG-001: a busy Finder answers slowly or with kAXErrorCannotComplete).
+    /// Test hook (BUG-001): FINDERSPEED_SIMULATE_AX="delay=0.6,fail=0.3" makes every AX read sleep
+    /// `delay` seconds and fail with kAXErrorCannotComplete with probability `fail`, like a busy Finder.
+    static let simulation: (delay: Double, fail: Double)? = {
+        guard let spec = ProcessInfo.processInfo.environment["FINDERSPEED_SIMULATE_AX"] else { return nil }
+        var d = 0.0, f = 0.0
+        for part in spec.split(separator: ",") {
+            let kv = part.split(separator: "=")
+            guard kv.count == 2, let v = Double(kv[1]) else { continue }
+            if kv[0] == "delay" { d = v } else if kv[0] == "fail" { f = v }
+        }
+        return (d, f)
+    }()
+
+    @discardableResult
+    static func copy(_ e: AXUIElement, _ name: String, _ v: inout AnyObject?) -> AXError {
+        if let sim = simulation {
+            if sim.delay > 0 { usleep(useconds_t(sim.delay * 1_000_000)) }
+            if Double.random(in: 0..<1) < sim.fail {
+                WindowDiagnostics.log("ax", "\(name) -> -25204 (simulated)")
+                return .cannotComplete
+            }
+        }
+        guard WindowDiagnostics.enabled else { return AXUIElementCopyAttributeValue(e, name as CFString, &v) }
+        let t0 = DispatchTime.now().uptimeNanoseconds
+        let err = AXUIElementCopyAttributeValue(e, name as CFString, &v)
+        let ms = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6
+        let benign: Set<AXError> = [.success, .noValue, .attributeUnsupported, .notImplemented]
+        if ms > 50 || !benign.contains(err) {
+            WindowDiagnostics.log("ax", String(format: "%@ -> %d in %.0f ms", name, err.rawValue, ms))
+        }
+        return err
     }
 
     static func string(_ e: AXUIElement, _ name: String) -> String? {
@@ -33,7 +68,7 @@ enum AX {
 
     static func windows(_ app: AXUIElement) -> [AXUIElement]? {
         var v: AnyObject?
-        guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &v) == .success else { return nil }
+        guard copy(app, kAXWindowsAttribute, &v) == .success else { return nil }
         return v as? [AXUIElement] ?? []
     }
 

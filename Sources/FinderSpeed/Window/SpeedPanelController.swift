@@ -83,6 +83,14 @@ public final class SpeedPanelController {
         appearanceObservation = NSApp.observe(\.effectiveAppearance, options: [.new]) { [weak self] _, _ in
             DispatchQueue.main.async { MainActor.assumeIsolated { self?.appearanceChanged() } }
         }
+        WindowDiagnostics.logEnvironment(reason: "panel attach")
+        if WindowDiagnostics.enabled {
+            let t = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated { if let self, self.target != nil { self.logState("tick") } }
+            }
+            RunLoop.main.add(t, forMode: .common)
+            diagTimer = t
+        }
         if observer.window != nil { handle(.appeared, observer.window) }
     }
 
@@ -103,22 +111,26 @@ public final class SpeedPanelController {
     private let shadow: ChromePanel
     private let hostingView: PanelHostingView
     private let rootView = PassThroughView()
-    private let fillEffect = NSVisualEffectView()
-    private let fillSolid = PassThroughView()
-    private let fillSolidMask = CALayer()
+    /// Body fill (masked to the body shape: square top, Finder-shaped bottom corners).
+    private let bodyFill = FillPatch()
     private let overlayView = PassThroughView()
     private let shadowRoot = PassThroughView()
     private let shadowView = PassThroughView()
-    private let bandEffect = NSVisualEffectView()
-    private let bandSolid = PassThroughView()
-    private let bandSolidMask = CALayer()
+    /// Band fill, in three separate patches (BUG-001 (d)): Finder's two bottom-corner curves and the
+    /// 4 pt strip over its bottom rim. Even if a mask failed to apply, the band can never be painted
+    /// across Finder's full width above the strip.
+    private let bandLeft = FillPatch()
+    private let bandRight = FillPatch()
+    private let bandStrip = FillPatch()
     private let bandOverlay = PassThroughView()
+    private var fillPatches: [FillPatch] { [bodyFill, bandLeft, bandRight, bandStrip] }
     private var widthConstraint: NSLayoutConstraint?
 
     private weak var observer: FinderProgressWindowObserver?
     private var token: FinderProgressWindowObserver.HandlerToken?
     private var workspaceObservers: [NSObjectProtocol] = []
     private var appearanceObservation: NSKeyValueObservation?
+    private var diagTimer: Timer?
 
     private var target: FinderProgressWindowObserver.WindowInfo?
     private var relayoutPending = false
@@ -133,10 +145,21 @@ public final class SpeedPanelController {
     private var sampleDebounce: DispatchWorkItem?
     private var waitingForSample = false
 
-    private struct RenderKey: Equatable { let width: Int; let height: Int; let dark: Bool; let active: Bool }
+    private struct RenderKey: Equatable { let width: Int; let height: Int; let dark: Bool; let active: Bool; let scale: Int }
 
     private func log(_ s: @autoclosure () -> String) {
-        if debugLogging { print("[panel] \(s())"); fflush(stdout) }
+        if WindowDiagnostics.enabled { WindowDiagnostics.log("panel", s()) }
+        else if debugLogging { print("[panel] \(s())"); fflush(stdout) }
+    }
+
+    /// Diagnostic snapshot (BUG-001): window alphas, frames, scale, fill mode.
+    private func logState(_ reason: String) {
+        guard WindowDiagnostics.enabled else { return }
+        log("\(reason): shown=\(isShown) opacity=\(String(format: "%.2f/%.2f", Double(rootView.layer?.opacity ?? -1), Double(shadowRoot.layer?.opacity ?? -1))) presented=\(String(format: "%.2f/%.2f", Double(rootView.layer?.presentation()?.opacity ?? -1), Double(shadowRoot.layer?.presentation()?.opacity ?? -1))) winAlpha=\(String(format: "%.2f/%.2f", body.alphaValue, shadow.alphaValue)) "
+            + "body=\(body.frame) chrome=\(shadow.frame) visible=\(body.isVisible)/\(shadow.isVisible) "
+            + "scale=\(body.backingScaleFactor) screen=\(body.screen?.localizedName ?? "nil") "
+            + "fill=\(usesSampledBackground ? "sampled" : "material") "
+            + "key=\(renderedKey.map { "\($0.width)x\($0.height)@\($0.scale)x dark=\($0.dark) active=\($0.active)" } ?? "nil")")
     }
 
     private func configureWindows() {
@@ -154,9 +177,23 @@ public final class SpeedPanelController {
             w.isReleasedWhenClosed = false
             w.animationBehavior = .none
             w.collectionBehavior = [.ignoresCycle, .fullScreenAuxiliary]
-            w.alphaValue = 0
+            // BUG-001 (c): the window alpha is never animated (an AppKit window-alpha animation is
+            // driven by the main thread and froze mid-fade when it stalled). Fades use the root
+            // layers' opacity instead, whose final value is set immediately.
+            w.alphaValue = 1
         }
         shadow.ignoresMouseEvents = true
+        for w in [body, shadow] {
+            NotificationCenter.default.addObserver(forName: NSWindow.didChangeBackingPropertiesNotification, object: w, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.screenChanged("backing properties") }
+            }
+            NotificationCenter.default.addObserver(forName: NSWindow.didChangeScreenNotification, object: w, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.screenChanged("screen") }
+            }
+        }
+        NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.screenChanged("screen parameters") }
+        }
 
         // Chrome window: the computed shadow image, then the band (fill + rim) over Finder's bottom.
         shadowRoot.wantsLayer = true
@@ -165,15 +202,7 @@ public final class SpeedPanelController {
         shadowView.layer?.contentsGravity = .resize
         shadowView.layer?.magnificationFilter = .linear
         shadowRoot.addSubview(shadowView)
-        bandEffect.material = .windowBackground
-        bandEffect.blendingMode = .behindWindow
-        bandEffect.state = .inactive
-        shadowRoot.addSubview(bandEffect)
-        bandSolid.wantsLayer = true
-        bandSolidMask.contentsGravity = .resize
-        bandSolid.layer?.mask = bandSolidMask
-        bandSolid.isHidden = true
-        shadowRoot.addSubview(bandSolid)
+        for p in [bandLeft, bandRight, bandStrip] { shadowRoot.addSubview(p) }
         bandOverlay.wantsLayer = true
         bandOverlay.layer?.contentsGravity = .resize
         shadowRoot.addSubview(bandOverlay)
@@ -181,19 +210,7 @@ public final class SpeedPanelController {
         // Body window: fill (material or solid), content, edge overlay. No band: starts at Finder's bottom.
         rootView.wantsLayer = true
         body.contentView = rootView
-
-        fillEffect.material = .windowBackground
-        fillEffect.blendingMode = .behindWindow
-        fillEffect.state = .inactive
-        fillEffect.autoresizingMask = [.width, .height]
-        rootView.addSubview(fillEffect)
-
-        fillSolid.wantsLayer = true
-        fillSolid.autoresizingMask = [.width, .height]
-        fillSolidMask.contentsGravity = .resize
-        fillSolid.layer?.mask = fillSolidMask
-        fillSolid.isHidden = true
-        rootView.addSubview(fillSolid)
+        rootView.addSubview(bodyFill)
 
         hostingView.translatesAutoresizingMaskIntoConstraints = false
         rootView.addSubview(hostingView)
@@ -209,6 +226,24 @@ public final class SpeedPanelController {
         overlayView.layer?.contentsGravity = .resize
         overlayView.autoresizingMask = [.width, .height]
         rootView.addSubview(overlayView)   // above the content: the rim is part of the window edge
+        rootView.alphaValue = 0
+        shadowRoot.alphaValue = 0
+    }
+
+    /// The panel moved to another screen or the backing scale changed: re-render at the new scale.
+    private func screenChanged(_ what: String) {
+        log("\(what) changed: scale \(body.backingScaleFactor), screen \(body.screen?.localizedName ?? "nil")")
+        renderedKey = nil
+        if target != nil { sync() }
+    }
+
+    /// The backing scale of the screen Finder's window is on (our windows may not be on screen yet).
+    private func backingScale(for frame: NSRect) -> Int {
+        let screen = NSScreen.screens.max { a, b in
+            a.frame.intersection(frame).width * a.frame.intersection(frame).height
+                < b.frame.intersection(frame).width * b.frame.intersection(frame).height
+        }
+        return max(1, Int((screen?.backingScaleFactor ?? body.backingScaleFactor).rounded()))
     }
 
     // MARK: Events
@@ -279,28 +314,37 @@ public final class SpeedPanelController {
         let f = t.frame
         let W = Int(f.width.rounded()), H = max(1, Int(height.rounded()))
         let band = WindowChromeRenderer.bandHeight
-        let key = RenderKey(width: W, height: H, dark: isDark, active: t.isActive)
+        let scale = backingScale(for: f)
+        let key = RenderKey(width: W, height: H, dark: isDark, active: t.isActive, scale: scale)
         CATransaction.begin()
         CATransaction.setDisableActions(true)
+        let cw = WindowChromeRenderer.cornerPatchWidth, sh = WindowChromeRenderer.stripHeight
         if key != renderedKey {
             let profile = WindowChromeProfile.profile(dark: key.dark, active: key.active)
-            if let img = WindowChromeRenderer.render(profile: profile, width: W, height: H),
-               let bandMask = img.mask.cropping(to: CGRect(x: 0, y: 0, width: W, height: band)),
-               let bodyMask = img.mask.cropping(to: CGRect(x: 0, y: band, width: W, height: H)),
-               let bandOvl = img.overlay.cropping(to: CGRect(x: 0, y: 0, width: W, height: band)),
-               let bodyOvl = img.overlay.cropping(to: CGRect(x: 0, y: band, width: W, height: H)) {
-                shadowView.layer?.contents = img.shadow
-                overlayView.layer?.contents = bodyOvl
-                fillEffect.maskImage = NSImage(cgImage: bodyMask, size: NSSize(width: W, height: H))
-                fillSolidMask.contents = bodyMask
-                bandOverlay.layer?.contents = bandOvl
-                bandEffect.maskImage = NSImage(cgImage: bandMask, size: NSSize(width: W, height: band))
-                bandSolidMask.contents = bandMask
-                renderedPads = (img.padX, img.padBelow)
-                renderedKey = key
+            if let img = WindowChromeRenderer.render(profile: profile, width: W, height: H, scale: scale) {
+                // Crops in pixels; images are `scale` pixels per point.
+                func crop(_ i: CGImage, _ x: Int, _ y: Int, _ w: Int, _ h: Int) -> CGImage? {
+                    i.cropping(to: CGRect(x: x * scale, y: y * scale, width: w * scale, height: h * scale))
+                }
+                let cornerRows = band - sh
+                if let bodyMask = crop(img.mask, 0, band, W, H),
+                   let leftMask = crop(img.mask, 0, 0, cw, cornerRows),
+                   let rightMask = crop(img.mask, W - cw, 0, cw, cornerRows),
+                   let bandOvl = crop(img.overlay, 0, 0, W, band),
+                   let bodyOvl = crop(img.overlay, 0, band, W, H) {
+                    for (layer, image) in [(shadowView.layer, img.shadow), (overlayView.layer, bodyOvl), (bandOverlay.layer, bandOvl)] {
+                        layer?.contents = image
+                        layer?.contentsScale = CGFloat(scale)
+                    }
+                    bodyFill.setMask(bodyMask, scale: scale)
+                    bandLeft.setMask(leftMask, scale: scale)
+                    bandRight.setMask(rightMask, scale: scale)
+                    bandStrip.setMask(nil, scale: scale)    // the strip is fully painted
+                    renderedPads = (img.padX, img.padBelow)
+                    renderedKey = key
+                    log("rendered chrome \(W)x\(H) @\(scale)x dark=\(key.dark) active=\(key.active)")
+                }
             }
-            fillEffect.state = key.active ? .active : .inactive
-            bandEffect.state = fillEffect.state
         }
         let x = f.minX.rounded(), bottom = f.minY.rounded()
         let bodyFrame = NSRect(x: x, y: bottom - CGFloat(H), width: CGFloat(W), height: CGFloat(H))
@@ -310,13 +354,17 @@ public final class SpeedPanelController {
         if body.frame != bodyFrame { body.setFrame(bodyFrame, display: true) }
         // Explicit frames: these subviews start at .zero, which autoresizing would keep at zero.
         let bounds = NSRect(origin: .zero, size: bodyFrame.size)
-        for v in [fillEffect, fillSolid, overlayView] as [NSView] where v.frame != bounds { v.frame = bounds }
-        fillSolidMask.frame = bounds
+        for v in [bodyFill, overlayView] as [NSView] where v.frame != bounds { v.frame = bounds }
         shadowView.frame = NSRect(origin: .zero, size: shadowFrame.size)
-        let bandFrame = NSRect(x: CGFloat(renderedPads.x), y: shadowFrame.height - CGFloat(band),
-                               width: CGFloat(W), height: CGFloat(band))
-        for v in [bandEffect, bandSolid, bandOverlay] as [NSView] where v.frame != bandFrame { v.frame = bandFrame }
-        bandSolidMask.frame = NSRect(origin: .zero, size: bandFrame.size)
+        let px = CGFloat(renderedPads.x), top = shadowFrame.height        // band top edge (non-flipped y)
+        let bandFrame = NSRect(x: px, y: top - CGFloat(band), width: CGFloat(W), height: CGFloat(band))
+        if bandOverlay.frame != bandFrame { bandOverlay.frame = bandFrame }
+        // Corner patches: the band rows above the strip; the strip: the band's bottom `sh` rows.
+        let leftF = NSRect(x: px, y: top - CGFloat(band - sh), width: CGFloat(cw), height: CGFloat(band - sh))
+        let rightF = NSRect(x: px + CGFloat(W - cw), y: leftF.minY, width: CGFloat(cw), height: CGFloat(band - sh))
+        let stripF = NSRect(x: px, y: top - CGFloat(band), width: CGFloat(W), height: CGFloat(sh))
+        for (v, fr) in [(bandLeft, leftF), (bandRight, rightF), (bandStrip, stripF)] where v.frame != fr { v.frame = fr }
+        for p in fillPatches { p.setActive(key.active) }
         CATransaction.commit()
         displayedHeight = CGFloat(H)
         log("layout body \(bodyFrame) shadow \(shadowFrame) active=\(key.active) dark=\(key.dark)")
@@ -416,16 +464,7 @@ public final class SpeedPanelController {
         usesSampledBackground = color != nil
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        for (solid, effect) in [(fillSolid, fillEffect), (bandSolid, bandEffect)] {
-            if let color {
-                solid.layer?.backgroundColor = color
-                solid.isHidden = false
-                effect.isHidden = true
-            } else {
-                solid.isHidden = true
-                effect.isHidden = false
-            }
-        }
+        for p in fillPatches { p.setFill(color) }
         CATransaction.commit()
     }
 
@@ -433,35 +472,123 @@ public final class SpeedPanelController {
 
     private func show() {
         guard !isShown else { return }
+        logState("show")
         isShown = true
         fadeGeneration += 1
-        log("show")
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = fadeDuration
-            body.animator().alphaValue = 1
-            shadow.animator().alphaValue = 1
-        }
+        // Make sure frames, masks and content are committed before anything becomes visible.
+        rootView.layoutSubtreeIfNeeded()
+        shadowRoot.layoutSubtreeIfNeeded()
+        body.displayIfNeeded(); shadow.displayIfNeeded()
+        fade(to: 1)
     }
 
     private func hide() {
         heightAnimation?.invalidate(); heightAnimation = nil
         waitingForSample = false
         guard isShown else { return }
+        logState("hide")
         isShown = false
         fadeGeneration += 1
         let gen = fadeGeneration
-        log("hide")
-        NSAnimationContext.runAnimationGroup({ ctx in
-            ctx.duration = fadeDuration
-            body.animator().alphaValue = 0
-            shadow.animator().alphaValue = 0
-        }, completionHandler: { [weak self] in
+        fade(to: 0)
+        // Order out after the fade. If the main thread is late, the panel is already invisible:
+        // the opacity's final value was set immediately.
+        DispatchQueue.main.asyncAfter(deadline: .now() + fadeDuration + 0.05) { [weak self] in
             MainActor.assumeIsolated {
                 guard let self, self.fadeGeneration == gen, !self.isShown else { return }
                 self.body.orderOut(nil)
                 self.shadow.orderOut(nil)
             }
-        })
+        }
+    }
+
+    /// BUG-001 (c): stall-proof fade. The layers' model opacity is set to the target immediately;
+    /// the visible transition is a Core Animation animation run by the render server, so neither a
+    /// busy main thread nor an interrupted animation can leave the panel half transparent.
+    private func fade(to target: Float) {
+        for v in [rootView, shadowRoot] as [NSView] {
+            guard let layer = v.layer else { v.alphaValue = CGFloat(target); continue }
+            let from = layer.presentation()?.opacity ?? layer.opacity
+            layer.removeAnimation(forKey: "fade")
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            layer.opacity = target
+            CATransaction.commit()
+            guard fadeDuration > 0, from != target else { continue }
+            let a = CABasicAnimation(keyPath: "opacity")
+            a.fromValue = from; a.toValue = target
+            a.duration = fadeDuration
+            a.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            layer.add(a, forKey: "fade")
+        }
+    }
+}
+
+/// One fill area: the material (fallback) or Finder's sampled solid colour, masked by an image.
+private final class FillPatch: NSView {
+    private let effect = NSVisualEffectView()
+    private let solid = CALayer()
+    private let solidMask = CALayer()
+    private var maskImage: CGImage?
+    private var maskScale = 1
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        effect.material = .windowBackground
+        effect.blendingMode = .behindWindow
+        effect.state = .active
+        effect.autoresizingMask = [.width, .height]
+        effect.frame = bounds
+        addSubview(effect)
+        solid.isHidden = true
+        solidMask.contentsGravity = .resize
+        layer?.addSublayer(solid)
+    }
+    convenience init() { self.init(frame: .zero) }
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func layout() {
+        super.layout()
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        effect.frame = bounds
+        solid.frame = bounds
+        solidMask.frame = solid.bounds
+        CATransaction.commit()
+    }
+
+    override var frame: NSRect { didSet { needsLayout = true; layoutSubtreeIfNeeded() } }
+
+    /// nil = fully painted.
+    func setMask(_ image: CGImage?, scale: Int) {
+        maskImage = image; maskScale = scale
+        if let image {
+            effect.maskImage = NSImage(cgImage: image, size: NSSize(width: CGFloat(image.width) / CGFloat(scale),
+                                                                    height: CGFloat(image.height) / CGFloat(scale)))
+            solidMask.contents = image
+            solidMask.contentsScale = CGFloat(scale)
+            solid.mask = solidMask
+        } else {
+            effect.maskImage = nil
+            solid.mask = nil
+        }
+    }
+
+    /// nil = material fallback.
+    func setFill(_ color: CGColor?) {
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        if let color { solid.backgroundColor = color }
+        solid.isHidden = color == nil
+        effect.isHidden = color != nil
+        CATransaction.commit()
+    }
+
+    /// Finder's background looks the same in both states (measured); keep the material active so
+    /// it never switches to a different rendering.
+    func setActive(_ active: Bool) {
+        if effect.state != .active { effect.state = .active }
     }
 }
 

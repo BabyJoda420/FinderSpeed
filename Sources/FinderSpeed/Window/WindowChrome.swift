@@ -100,6 +100,8 @@ enum WindowChromeRenderer {
     static let bandHeight = 24
     /// Rows along Finder's bottom edge that are always painted (they cover Finder's bottom rim).
     static let stripHeight = 4
+    /// Width of each band corner patch (Finder's bottom-corner curve is narrower than this).
+    static let cornerPatchWidth = 24
 
     struct Images {
         let shadow: CGImage   // (width + 2 padX) x (band + height + padBelow), black with alpha
@@ -109,7 +111,31 @@ enum WindowChromeRenderer {
         let padBelow: Int
     }
 
-    /// `width`: Finder's window width; `height`: our body height below Finder's bottom edge.
+    /// `width`: Finder's window width; `height`: our body height below Finder's bottom edge (points).
+    /// `scale`: pixels per point of the target screen (BUG-001 (e)). The measured data is 1 px per
+    /// point, so the chrome is evaluated at 1x and each point is replicated to scale x scale pixels; the
+    /// images are `scale` times larger in pixels (point geometry unchanged).
+    static func render(profile p: WindowChromeProfile, width W: Int, height H: Int, scale: Int) -> Images? {
+        guard let base = render(profile: p, width: W, height: H) else { return nil }
+        guard scale > 1 else { return base }
+        // Replicate pixels (no interpolation): the 1 pt outline ring, the rim and the masks keep hard
+        // edges on point boundaries, and each point averages to exactly the measured 1x value.
+        guard let s = upsample(base.shadow, scale, quality: .none), let m = upsample(base.mask, scale, quality: .none),
+              let o = upsample(base.overlay, scale, quality: .none) else { return nil }
+        return Images(shadow: s, mask: m, overlay: o, padX: base.padX, padBelow: base.padBelow)
+    }
+
+    static func upsample(_ image: CGImage, _ scale: Int, quality: CGInterpolationQuality) -> CGImage? {
+        let w = image.width * scale, h = image.height * scale
+        guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                                  space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        ctx.interpolationQuality = quality
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+        return ctx.makeImage()
+    }
+
+    /// 1 px per point.
     static func render(profile p: WindowChromeProfile, width W: Int, height H: Int) -> Images? {
         let band = bandHeight
         let curve = p.curveWidths   // per band row (last `cornerSize` rows above Finder's bottom)
